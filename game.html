@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Mansion</title>
+  <style>
+    body {
+      background: #222;
+      color: #eee;
+      font-family: "Consolas", monospace;
+      margin: 0;
+      padding: 0;
+    }
+    #main {
+      max-width: 700px;
+      margin: 40px auto;
+      background: #2d2d2d;
+      padding: 24px 32px 16px 32px;
+      border-radius: 10px;
+      box-shadow: 0 2px 9px #111;
+    }
+    #console {
+      background: #181818;
+      min-height: 260px;
+      border-radius: 8px;
+      padding: 10px;
+      overflow-y: auto;
+      margin-bottom: 12px;
+    }
+    #inputLine {
+      display: flex;
+    }
+    #cmd {
+      flex: 1;
+      padding: 7px;
+      font-size: 17px;
+      border-radius: 4px;
+      border: none;
+      background: #333;
+      color: #eee;
+      margin-right: 7px;
+    }
+    #submit {
+      padding: 7px 14px;
+      border-radius: 4px;
+      border: none;
+      background: #433;
+      color: #eee;
+      cursor: pointer;
+      font-size: 16px;
+    }
+    #info, #inv {
+      background: #191919;
+      padding: 10px;
+      border-radius: 6px;
+      margin-bottom: 8px;
+    }
+    .npcHostile { color: #ff6b6b; }
+    .npcNonHostile { color: #79ff97; }
+    .item { color: #fd0; }
+    .room { color: #7bcdff; }
+    .win { color: #79ff97; font-weight: bold;}
+    .game-over { color: #ff6b6b; font-weight: bold;}
+  </style>
+</head>
+<body>
+<div id="main">
+  <div id="console"></div>
+  <div id="info"></div>
+  <div id="inv"></div>
+  <form id="inputLine" autocomplete="off">
+    <input type="text" id="cmd" autofocus placeholder="Type command (help for options)"/>
+    <button type="submit" id="submit">Go</button>
+  </form>
+</div>
+
+<script>
+const Game = (() => {
+  // Utility
+  function el(id) { return document.getElementById(id); }
+  function escapeHtml(s) { return s.replace(/[<>&"]/g, c => ({'<':'&lt;', '>':'&gt;', '&':'&amp;', '"':'&quot;'}[c])); }
+
+  // Game Data Structures
+  class Item {
+    constructor(name, desc, takeable=true, use=null) {
+      this.name = name; this.desc = desc; this.takeable = takeable; this.use = use; // {type, target}
+    }
+  }
+  class NPC {
+    constructor(name, desc, hostile=false, hp=10, attack=3, defeatMsg='') {
+      this.name = name; this.desc = desc; this.hostile = hostile; this.hp = hp; this.attack = attack;
+      this.defeatMsg = defeatMsg;
+    }
+  }
+  class Room {
+    constructor(name, desc) {
+      this.name = name; this.desc = desc; this.items = []; this.npcs = []; this.exits = {}; // dir: roomName
+    }
+  }
+
+  // Rooms
+  const rooms = {};
+  rooms["Foyer"] = new Room("Foyer", "A dusty foyer. There are doors to the north and east.");
+  rooms["Hall"] = new Room("Hall", "A grand hall with faded portraits. Exits south, east, west, and down (locked).");
+  rooms["Armory"] = new Room("Armory", "Rows of rusty swords and armor. Exit west.");
+  rooms["Library"] = new Room("Library", "Shelves packed with odd books. Exit north.");
+  rooms["Dungeon"] = new Room("Dungeon", "Dark, damp... something lurks here. Exits up.");
+  rooms["Secret Room"] = new Room("Secret Room", "A tiny hidden chamber. Treasure lies within! Exit south.");
+
+  // Exits
+  rooms["Foyer"].exits = { north: "Hall", east: "Armory" };
+  rooms["Hall"].exits = { south: "Foyer", east: "Library", west: "Armory" };
+  rooms["Armory"].exits = { west: "Foyer", east: "Hall" };
+  rooms["Library"].exits = { north: "Secret Room", west: "Hall" };
+  rooms["Dungeon"].exits = { up: "Hall" };
+  rooms["Secret Room"].exits = { south: "Library" };
+
+  // Items
+  const items = {
+    sword: new Item("sword", "A sharp longsword. Feels powerful.", true, {type: "attack", target: "npc"}),
+    key: new Item("key", "An old iron key. Maybe unlocks something.", true, {type: "unlock", target: "room"}),
+    potion: new Item("potion", "A small red vial. Heals 10 HP.", true, {type: "heal", target: "player"}),
+    book: new Item("book", "A dusty tome: 'Secret Room north of Library.'", true),
+    treasure: new Item("treasure", "Gold! You're rich.", false)
+  };
+
+  rooms["Armory"].items.push(items.sword);
+  rooms["Hall"].items.push(items.key, items.potion);
+  rooms["Library"].items.push(items.book);
+  rooms["Secret Room"].items.push(items.treasure);
+
+  // NPCs
+  const npcs = {
+    goblin: new NPC("goblin", "A nasty goblin with a dagger.", true, 6, 2, "The goblin falls!"),
+    wizard: new NPC("wizard", "A mysterious wizard blocks the treasure.", true, 12, 4, "The wizard vanishes in a swirl of smoke!"),
+    guard: new NPC("guard", "A sleepy guard protects a dungeon door.", false)
+  };
+  rooms["Hall"].npcs.push(npcs.guard);
+  rooms["Dungeon"].npcs.push(npcs.goblin);
+  rooms["Secret Room"].npcs.push(npcs.wizard);
+
+  // Player state
+  const player = {
+    room: "Foyer",
+    hp: 20,
+    attack: 3,
+    inventory: []
+  };
+
+  // Room/door state
+  let dungeonUnlocked = false;
+  let winFlag = false;
+
+  // UI
+  function clearConsole() { el("console").innerHTML = ""; }
+  function output(msg, cls="") {
+    el("console").innerHTML += `<div${cls ? ' class="'+cls+'"' : ''}>${escapeHtml(msg)}</div>`;
+    el("console").scrollTop = el("console").scrollHeight;
+  }
+
+  function showInfo() {
+    const r = rooms[player.room];
+    el("info").innerHTML =
+      `<b>You are in:</b> <span class="room">${r.name}</span><br>
+      <i>${escapeHtml(r.desc)}</i><br>
+      <b>Exits:</b> ${Object.keys(r.exits).map(d=>escapeHtml(d)).join(", ")}<br>
+      <b>Items:</b> ${r.items.length? r.items.map(i=>`<span class='item'>${escapeHtml(i.name)}</span>`).join(","):"None"}<br>
+      <b>NPCs:</b> ${r.npcs.length? r.npcs.map(n=>`<span class="${n.hostile?'npcHostile':'npcNonHostile'}">${escapeHtml(n.name)}</span>`).join(","):'None'}`;
+    el("inv").innerHTML =
+      `<b>Inventory:</b> ${player.inventory.length ? player.inventory.map(i=>`<span class='item'>${escapeHtml(i.name)}</span>`).join(","):"Empty"}
+      <span style="float:right;"><b>HP:</b> ${player.hp}</span>`;
+  }
+
+  function describeRoom() { showInfo(); }
+
+  function getItemByName(name, list) {
+    name = name.toLowerCase();
+    return list.find(i => i.name.toLowerCase() === name);
+  }
+  function getNpcByName(name, list) {
+    name = name.toLowerCase();
+    return list.find(n => n.name.toLowerCase() === name && n.hp > 0);
+  }
+
+  // Command Parser & Handlers
+  function handle(cmdLine) {
+    if(winFlag) return;
+    let cmd = cmdLine.trim().toLowerCase();
+    if(!cmd) return;
+    let verb = cmd.split(" ")[0], arg = cmd.slice(verb.length).trim();
+
+    switch (verb) {
+      case "move": case "go":
+        if(!arg) { output("Where?"); break; }
+        let r = rooms[player.room];
+        if(arg in r.exits) {
+          // Dungeon locking
+          if(r.exits[arg]==="Dungeon" && !dungeonUnlocked) {
+            output("The door is locked! Perhaps a key unlocks it.");
+            break;
+          }
+          player.room = r.exits[arg];
+          output(`You go ${arg}.`);
+          // Hostile NPC attack
+          let roomObj = rooms[player.room];
+          let firstHostile = roomObj.npcs.find(n=>n.hostile && n.hp>0);
+          if(firstHostile) {
+            output(`${firstHostile.name} attacks you!`);
+            player.hp -= firstHostile.attack;
+            output(`You lose ${firstHostile.attack} HP.`);
+            if(player.hp <= 0) { endGame("You died!"); break; }
+          }
+          describeRoom();
+        } else { output("No exit that way."); }
+        break;
+
+      case "look": case "ls":
+        describeRoom();
+        break;
+
+      case "take": case "get":
+        if(!arg) { output("Take what?"); break; }
+        let itemObj = getItemByName(arg, rooms[player.room].items);
+        if(itemObj && itemObj.takeable) {
+          output(`You take the ${itemObj.name}.`);
+          player.inventory.push(itemObj);
+          rooms[player.room].items = rooms[player.room].items.filter(i=>i!==itemObj);
+          showInfo();
+        } else { output("Can't take that."); }
+        break;
+
+      case "drop":
+        if(!arg) { output("Drop what?"); break; }
+        let invObj = getItemByName(arg, player.inventory);
+        if(invObj) {
+          output(`You drop the ${invObj.name}.`);
+          player.inventory = player.inventory.filter(i=>i!==invObj);
+          rooms[player.room].items.push(invObj);
+          showInfo();
+        } else { output("You don't have that."); }
+        break;
+
+      case "inventory": case "inv":
+        showInfo();
+        break;
+
+      case "examine": case "inspect":
+        // Search room items, inventory, npcs
+        let exObj = getItemByName(arg, rooms[player.room].items)
+                 || getItemByName(arg, player.inventory);
+        if(exObj) { output(exObj.desc); break; }
+        let exNpc = getNpcByName(arg, rooms[player.room].npcs);
+        if(exNpc) { output(exNpc.desc); break; }
+        output("Nothing found to examine.");
+        break;
+
+      case "use":
+        if(!arg) { output("Use what?"); break; }
+        let target = "";
+        let itemname = arg, onIndex = arg.indexOf(" on ");
+        if(onIndex>-1) {
+          itemname = arg.slice(0,onIndex).trim();
+          target = arg.slice(onIndex+4).trim();
+        }
+        let useObj = getItemByName(itemname, player.inventory);
+        if(!useObj) { output("You lack that item."); break; }
+        if(useObj.use) {
+          if(useObj.use.type==="heal" && useObj.use.target==="player") {
+            player.hp += 10;
+            output("You drink the potion and recover 10 HP.");
+            player.inventory = player.inventory.filter(i=>i!==useObj);
+            showInfo(); break;
+          }
+          if(useObj.use.type==="unlock" && useObj.use.target==="room") {
+            if(player.room==="Hall" && !dungeonUnlocked) {
+              rooms["Hall"].exits["down"] = "Dungeon";
+              dungeonUnlocked = true;
+              output("You unlock the door to the Dungeon!");
+              player.inventory = player.inventory.filter(i=>i!==useObj);
+              showInfo(); break;
+            } else { output("Nothing happens."); break; }
+          }
+          if(useObj.use.type==="attack" && useObj.use.target==="npc") {
+            if(!target) { output("Use on which NPC?"); break; }
+            let npcObj = getNpcByName(target, rooms[player.room].npcs);
+            if(!npcObj || !npcObj.hostile) { output("No hostile NPC to attack."); break; }
+            let dmg = 7;
+            npcObj.hp -= dmg;
+            output(`You strike ${npcObj.name} with ${useObj.name} (${dmg} damage).`);
+            if(npcObj.hp <= 0) {
+              output(`<span class='win'>${npcObj.defeatMsg}</span>`);
+              if(npcObj === npcs.wizard) {
+                winGame("You defeated the wizard! You claim the treasure!");
+                break;
+              }
+              rooms[player.room].npcs = rooms[player.room].npcs.filter(n=>n!==npcObj);
+            } else {
+              output(`${npcObj.name} HP: ${npcObj.hp}`);
+              player.hp -= npcObj.attack;
+              output(`${npcObj.name} hits back! You lose ${npcObj.attack} HP.`);
+              if(player.hp <= 0) { endGame("You died!"); break; }
+            }
+            break;
+          }
+        }
+        output("Can't use that item now."); break;
+
+      case "talk":
+        let npcTalk = getNpcByName(arg, rooms[player.room].npcs);
+        if(npcTalk && !npcTalk.hostile) {
+          if(npcTalk===npcs.guard) {
+            output("The guard mumbles: 'Dungeon's locked but the key's in the hall.'");
+          } else {
+            output(`The ${npcTalk.name} says nothing interesting.`);
+          }
+        } else { output("They ignore you."); }
+        break;
+
+      case "attack":
+        let npcAtk = getNpcByName(arg, rooms[player.room].npcs);
+        if(!npcAtk || !npcAtk.hostile) { output("No hostile NPC here."); break; }
+        let dmg = player.attack;
+        npcAtk.hp -= dmg;
+        output(`You punch ${npcAtk.name} for ${dmg} damage.`);
+        if(npcAtk.hp <= 0) {
+          output(`<span class='win'>${npcAtk.defeatMsg}</span>`);
+          if(npcAtk === npcs.wizard) {
+            winGame("You defeated the wizard! You claim the treasure!");
+            break;
+          }
+          rooms[player.room].npcs = rooms[player.room].npcs.filter(n=>n!==npcAtk);
+        } else {
+          output(`${npcAtk.name} HP: ${npcAtk.hp}`);
+          player.hp -= npcAtk.attack;
+          output(`${npcAtk.name} hits back! You lose ${npcAtk.attack} HP.`);
+          if(player.hp <= 0) { endGame("You died!"); break; }
+        }
+        break;
+
+      case "help":
+        output(`Commands:
+move <direction>        - Move in a direction (north, south, east, west, up, down)
+look                    - Describe the room
+take <item>             - Take an item
+drop <item>             - Drop an item
+inventory               - Show your items
+examine <item/npc>      - Describe an item/NPC
+use <item> [on <target>]- Use item (heal/unlock/attack)
+talk <npc>              - Speak to a non-hostile NPC
+attack <npc>            - Attack a hostile NPC
+help                    - Show these options
+quit                    - Exit game`);
+        break;
+      case "quit":
+        endGame("Thanks for playing.");
+        break;
+
+      default:
+        output("Unknown command. Type 'help'.");
+    }
+  }
+
+  // Win/Lose
+  function winGame(msg) {
+    winFlag = true;
+    output(msg, "win");
+    output("You are victorious! Refresh page to play again.", "win");
+    showInfo();
+    disableInput();
+  }
+  function endGame(msg) {
+    output(msg, "game-over");
+    output("Game Over.<br><b>Refresh</b> page to play again.", "game-over");
+    showInfo();
+    disableInput();
+    winFlag = true;
+  }
+  function disableInput() {
+    el("cmd").disabled = true; el("submit").disabled = true;
+  }
+
+  function start() {
+    clearConsole(); showInfo();
+    output("--- Welcome to Zork-type RPG ---");
+    output("Type 'help' for command list.");
+    describeRoom();
+    el("cmd").focus();
+  }
+
+  return { handle, start };
+})();
+
+Game.start();
+document.getElementById("inputLine").onsubmit = function(e) {
+  e.preventDefault();
+  let cmd = document.getElementById("cmd").value;
+  document.getElementById("cmd").value = "";
+  Game.handle(cmd);
+};
+</script>
+</body>
+</html>
